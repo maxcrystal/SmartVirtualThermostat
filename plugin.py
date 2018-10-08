@@ -1,11 +1,9 @@
 """
 Smart Virtual Thermostat python plugin for Domoticz
-
 Author: Logread,
         adapted from the Vera plugin by Antor, see:
             http://www.antor.fr/apps/smart-virtual-thermostat-eng-2/?lang=en
             https://github.com/AntorFr/SmartVT
-
 Version:    0.0.1: alpha
             0.0.2: beta, with new connection object from Domoticz Python plugin framework
             0.0.3: bug fixes + added thermostat temp update even if in Off or Forced modes
@@ -47,10 +45,15 @@ Version:    0.0.1: alpha
                    (3) some minor error checks added when parsing parameters at startup
                    (4) implement new debugging levels introduced by @dnpwwo
                    (5) some code cleanup and optimization
-
+            0.4.2: Unpublished test
+            0.4.3: Call domoticz json API at least every 5 minutes to avoid the 10 mins timout of connections that
+                    floods domoticz's log with "Incoming Connection from ...." messages. Take advantage of this to
+                    update the temperature readings more often than upon each calculation
+            0.4.4: implement list of active/dead sensors to avoid continuous logging of dead sensors,
+            		also added some ´fool proof´ error handlers based on users feedback
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.1" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.4" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -97,6 +100,7 @@ import urllib.request as request
 from datetime import datetime, timedelta
 import time
 import base64
+import itertools
 
 class deviceparam:
 
@@ -117,6 +121,7 @@ class BasePlugin:
         self.pauseondelay = 2  # time between pause sensor actuation and actual pause
         self.pauseoffdelay = 1  # time between end of pause sensor actuation and end of actual pause
         self.forcedduration = 60  # time in minutes for the forced mode
+        self.ActiveSensors = {}
         self.InTempSensors = []
         self.OutTempSensors = []
         self.Heaters = []
@@ -207,6 +212,10 @@ class BasePlugin:
         Domoticz.Debug("Outside Temperature sensors = {}".format(self.OutTempSensors))
         self.Heaters = parseCSV(Parameters["Mode3"])
         Domoticz.Debug("Heaters = {}".format(self.Heaters))
+        
+        # build dict of status of all temp sensors to be used when handling timeouts
+        for sensor in itertools.chain(self.InTempSensors, self.OutTempSensors):
+            self.ActiveSensors[sensor] = True
 
         # splits additional parameters
         params = parseCSV(Parameters["Mode5"])
@@ -271,6 +280,11 @@ class BasePlugin:
     def onHeartbeat(self):
 
         now = datetime.now()
+        
+        # fool proof checking.... based on users feedback
+        if not all(device in Devices for device in (1,2,3,4,5,6)):
+            Domoticz.Error("one or more devices required by the plugin is/are missing, please check domoticz device creation settings and restart !")
+            return
 
         if Devices[1].sValue == "0":  # Thermostat is off
             if self.forced or self.heat:  # thermostat setting was just changed so we kill the heating
@@ -278,10 +292,6 @@ class BasePlugin:
                 self.endheat = now
                 Domoticz.Debug("Switching heat Off !")
                 self.switchHeat(False)
-
-            if self.nexttemps <= now:
-                # call the Domoticz json API for a temperature devices update, to get the lastest temps...
-                self.readTemps()
 
         elif Devices[1].sValue == "20":  # Thermostat is in forced mode
             if self.forced:
@@ -296,10 +306,6 @@ class BasePlugin:
                 self.endheat = now + timedelta(minutes=self.forcedduration)
                 Domoticz.Debug("Forced mode On !")
                 self.switchHeat(True)
-
-            if self.nexttemps <= now:
-                # call the Domoticz json API for a temperature devices update, to get the lastest temps...
-                self.readTemps()
 
         else:  # Thermostat is in mode auto
 
@@ -329,10 +335,6 @@ class BasePlugin:
                     self.pause = True
                     self.switchHeat(False)
 
-            elif self.pause and self.nexttemps <= now:  # added to update thermostat temp even in pause mode
-                # call the Domoticz json API for a temperature devices update, to get the lastest temps...
-                self.readTemps()
-
             elif (self.nextcalc <= now) and not self.pause:  # we start a new calculation
                 self.nextcalc = now + timedelta(minutes=self.calculate_period)
                 Domoticz.Debug("Next calculation time will be : " + str(self.nextcalc))
@@ -350,6 +352,11 @@ class BasePlugin:
                 else:
                     # make sure we switch off heating if there was an error with reading the temp
                     self.switchHeat(False)
+
+        if self.nexttemps <= now:
+            # call the Domoticz json API for a temperature devices update, to get the lastest temps (and avoid the
+            # connection time out time after 10mins that floods domoticz logs in versions of domoticz since spring 2018)
+            self.readTemps()
 
         # check if need to refresh setpoints so that they do not turn red in GUI
         if self.nextupdate <= now:
@@ -461,6 +468,11 @@ class BasePlugin:
                     else:
                         Domoticz.Error("Device with idx={} does not seem to be a switch !".format(idx))
 
+        # fool proof checking.... based on users feedback
+        if len(switches) == 0:
+            Domoticz.Error("none of the devices in the 'heaters' parameter is a switch... no action !")
+            return
+
         # flip on / off as needed
         self.heat = switch
         command = "On" if switch else "Off"
@@ -474,8 +486,8 @@ class BasePlugin:
 
     def readTemps(self):
 
-        # set update flag for next temp update (used only when in off, forced mode or pause is active)
-        self.nexttemps = datetime.now() + timedelta(minutes=self.calculate_period)
+        # set update flag for next temp update
+        self.nexttemps = datetime.now() + timedelta(minutes=5)
 
         # fetch all the devices from the API and scan for sensors
         noerror = True
@@ -489,20 +501,16 @@ class BasePlugin:
                     if "Temp" in device:
                         Domoticz.Debug("device: {}-{} = {}".format(device["idx"], device["Name"], device["Temp"]))
                         # check temp sensor is not timed out
-                        if not SensorTimedOut(device["LastUpdate"]):
+                        if not self.SensorTimedOut(idx, device["Name"], device["LastUpdate"]):
                             listintemps.append(device["Temp"])
-                        else:
-                            Domoticz.Error("skipping timed out temperature sensor {}".format(device["Name"]))
                     else:
                         Domoticz.Error("device: {}-{} is not a Temperature sensor".format(device["idx"], device["Name"]))
                 elif idx in self.OutTempSensors:
                     if "Temp" in device:
                         Domoticz.Debug("device: {}-{} = {}".format(device["idx"], device["Name"], device["Temp"]))
                         # check temp sensor is not timed out
-                        if not SensorTimedOut(device["LastUpdate"]):
+                        if not self.SensorTimedOut(idx, device["Name"], device["LastUpdate"]):
                             listouttemps.append(device["Temp"])
-                        else:
-                            Domoticz.Error("skipping timed out temperature sensor {}".format(device["Name"]))
                     else:
                         Domoticz.Error("device: {}-{} is not a Temperature sensor".format(device["idx"], device["Name"]))
 
@@ -574,6 +582,31 @@ class BasePlugin:
         elif level == "Normal":
             Domoticz.Log(message)
 
+    def SensorTimedOut(self, idx, name, datestring):
+
+        def LastUpdate(datestring):
+            dateformat = "%Y-%m-%d %H:%M:%S"
+            # the below try/except is meant to address an intermittent python bug in some embedded systems
+            try:
+                result = datetime.strptime(datestring, dateformat)
+            except TypeError:
+                result = datetime(*(time.strptime(datestring, dateformat)[0:6]))
+            return result
+
+        timedout = LastUpdate(datestring) + timedelta(minutes=int(Settings["SensorTimeout"])) < datetime.now()
+
+        # handle logging of time outs... only log when status changes (less clutter in logs)
+        if timedout:
+            if self.ActiveSensors[idx]:
+                Domoticz.Error("skipping timed out temperature sensor '{}'".format(name))
+                self.ActiveSensors[idx] = False
+        else:
+            if not self.ActiveSensors[idx]:
+                Domoticz.Status("previously timed out temperature sensor '{}' is back online".format(name))
+                self.ActiveSensors[idx] = True
+
+        return timedout
+
 
 global _plugin
 _plugin = BasePlugin()
@@ -600,21 +633,6 @@ def onHeartbeat():
 
 
 # Plugin utility functions ---------------------------------------------------
-
-
-def SensorTimedOut(datestring):
-
-    def LastUpdate(datestring):
-        dateformat = "%Y-%m-%d %H:%M:%S"
-        # the below try/except is meant to address an intermittent python bug in some embedded systems
-        try:
-            result = datetime.strptime(datestring, dateformat)
-        except TypeError:
-            result = datetime(*(time.strptime(datestring, dateformat)[0:6]))
-        return result
-
-    return LastUpdate(datestring) + timedelta(minutes=int(Settings["SensorTimeout"])) < datetime.now()
-
 
 def parseCSV(strCSV):
 
