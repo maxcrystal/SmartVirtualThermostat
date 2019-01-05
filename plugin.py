@@ -51,9 +51,13 @@ Version:    0.0.1: alpha
                     update the temperature readings more often than upon each calculation
             0.4.4: implement list of active/dead sensors to avoid continuous logging of dead sensors,
             		also added some ´fool proof´ error handlers based on users feedback
+            0.4.5: adjust uservariable creation to breaking change introduced by domoticz version 4.10298
+                    thanks to GitHub contributor @informagico
+            0.4.6: some clean up of logging levels (accept older versions of domoticz) and variables scoping/typing
+            0.4.7: slight adjustement to verbose logging to reduce clutter
 """
 """
-<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.4" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
+<plugin key="SVT" name="Smart Virtual Thermostat" author="logread" version="0.4.7" wikilink="https://www.domoticz.com/wiki/Plugins/Smart_Virtual_Thermostat.html" externallink="https://github.com/999LV/SmartVirtualThermostat.git">
     <description>
         <h2>Smart Virtual Thermostat</h2><br/>
         Easily implement in Domoticz an advanced virtual thermostat based on time modulation<br/>
@@ -101,6 +105,7 @@ from datetime import datetime, timedelta
 import time
 import base64
 import itertools
+from distutils.version import LooseVersion
 
 class deviceparam:
 
@@ -126,14 +131,14 @@ class BasePlugin:
         self.OutTempSensors = []
         self.Heaters = []
         self.InternalsDefaults = {
-            'ConstC': 60,  # inside heating coeff, depends on room size & power of your heater (60 by default)
-            'ConstT': 1,  # external heating coeff,depends on the insulation relative to the outside (1 by default)
+            'ConstC': float(60),  # inside heating coeff, depends on room size & power of your heater (60 by default)
+            'ConstT': float(1),  # external heating coeff,depends on the insulation relative to the outside (1 by default)
             'nbCC': 0,  # number of learnings for ConstC
             'nbCT': 0,  # number of learnings for ConstT
             'LastPwr': 0,  # % power from last calculation
-            'LastInT': 0,  # inside temperature at last calculation
-            'LastOutT': 0,  # outside temprature at last calculation
-            'LastSetPoint': 20,  # setpoint at time of last calculation
+            'LastInT': float(0),  # inside temperature at last calculation
+            'LastOutT': float(0),  # outside temprature at last calculation
+            'LastSetPoint': float(20),  # setpoint at time of last calculation
             'ALStatus': 0}  # AutoLearning status (0 = uninitialized, 1 = initialized, 2 = disabled)
         self.Internals = self.InternalsDefaults.copy()
         self.heat = False
@@ -150,6 +155,8 @@ class BasePlugin:
         self.nextupdate = self.endheat
         self.nexttemps = self.endheat
         self.learn = True
+        self.loglevel = None
+        self.statussupported = True
         return
 
 
@@ -169,6 +176,12 @@ class BasePlugin:
         else:
             self.debug = False
             Domoticz.Debugging(0)
+
+        # check if the host domoticz version supports the Domoticz.Status() python framework function
+        try:
+            Domoticz.Status("This version of domoticz allows status logging by the plugin (in verbose mode)")
+        except Exception:
+            self.statussupported = False
 
         # create the child devices if these do not exist yet
         devicecreated = []
@@ -207,11 +220,11 @@ class BasePlugin:
 
         # build lists of sensors and switches
         self.InTempSensors = parseCSV(Parameters["Mode1"])
-        Domoticz.Debug("Inside Temperature sensors = {}".format(self.InTempSensors))
+        self.WriteLog("Inside Temperature sensors = {}".format(self.InTempSensors), "Verbose")
         self.OutTempSensors = parseCSV(Parameters["Mode2"])
-        Domoticz.Debug("Outside Temperature sensors = {}".format(self.OutTempSensors))
+        self.WriteLog("Outside Temperature sensors = {}".format(self.OutTempSensors), "Verbose")
         self.Heaters = parseCSV(Parameters["Mode3"])
-        Domoticz.Debug("Heaters = {}".format(self.Heaters))
+        self.WriteLog("Heaters = {}".format(self.Heaters), "Verbose")
         
         # build dict of status of all temp sensors to be used when handling timeouts
         for sensor in itertools.chain(self.InTempSensors, self.OutTempSensors):
@@ -326,18 +339,18 @@ class BasePlugin:
 
             elif self.pause and not self.pauserequested:  # we are in pause and the pause switch is now off
                 if self.pauserequestchangedtime + timedelta(minutes=self.pauseoffdelay) <= now:
-                    Domoticz.Debug("Pause is now Off")
+                    self.WriteLog("Pause is now Off", "Status")
                     self.pause = False
 
             elif not self.pause and self.pauserequested:  # we are not in pause and the pause switch is now on
                 if self.pauserequestchangedtime + timedelta(minutes=self.pauseondelay) <= now:
-                    Domoticz.Debug("Pause is now On")
+                    self.WriteLog("Pause is now On", "Status")
                     self.pause = True
                     self.switchHeat(False)
 
             elif (self.nextcalc <= now) and not self.pause:  # we start a new calculation
                 self.nextcalc = now + timedelta(minutes=self.calculate_period)
-                Domoticz.Debug("Next calculation time will be : " + str(self.nextcalc))
+                self.WriteLog("Next calculation time will be : " + str(self.nextcalc), "Verbose")
 
                 # make current setpoint used in calculation reflect the select mode (10= normal, 20 = economy)
                 if Devices[2].sValue == "10":
@@ -367,8 +380,10 @@ class BasePlugin:
 
     def AutoMode(self):
 
+        self.WriteLog("Temperatures: Inside = {} / Outside = {}".format(self.intemp, self.outtemp), "Verbose")
+
         if self.intemp > self.setpoint + self.deltamax:
-            Domoticz.Debug("Temperature exceeds setpoint")
+            self.WriteLog("Temperature exceeds setpoint", "Verbose")
             overshoot = True
             power = 0
         else:
@@ -390,7 +405,8 @@ class BasePlugin:
 
         # apply minimum power as required
         if power <= self.minheatpower and (Parameters["Mode4"] == "Forced" or not overshoot):
-            Domoticz.Debug("Calculated power is {}, applying minimum power of {}".format(power, self.minheatpower))
+            self.WriteLog(
+                "Calculated power is {}, applying minimum power of {}".format(power, self.minheatpower), "Verbose")
             power = self.minheatpower
 
         heatduration = round(power * self.calculate_period / 100)
@@ -533,8 +549,8 @@ class BasePlugin:
             Domoticz.Debug("No Outside Temperature found...")
             self.outtemp = None
 
-        self.WriteLog("Inside Temperature = {}".format(self.intemp), "Verbose")
-        self.WriteLog("Outside Temperature = {}".format(self.outtemp), "Verbose")
+        Domoticz.Debug("Inside Temperature = {}".format(self.intemp))
+        Domoticz.Debug("Outside Temperature = {}".format(self.outtemp))
         return noerror
 
 
@@ -555,8 +571,25 @@ class BasePlugin:
             if novar:
                 # create user variable since it does not exist
                 self.WriteLog("User Variable {} does not exist. Creation requested".format(varname), "Verbose")
-                DomoticzAPI("type=command&param=adduservariable&vname={}&vtype=2&vvalue={}".format(
-                    varname, str(self.InternalsDefaults)))
+                
+		#check for Domoticz version:
+                # there is a breaking change on dzvents_version 2.4.9, API was changed from 'saveuservariable' to 'adduservariable'
+                # using 'saveuservariable' on latest versions returns a "status = 'ERR'" error
+
+                # get a status of the actual running Domoticz instance, set the parameter accordigly
+                parameter = "saveuservariable"
+                domoticzInfo = DomoticzAPI("type=command&param=getversion")
+                if domoticzInfo is None:
+                    Domoticz.Error("Unable to fetch Domoticz info... unable to determine version")
+                else:
+                    if domoticzInfo and LooseVersion(domoticzInfo["dzvents_version"]) >= LooseVersion("2.4.9"):
+                        self.WriteLog("Use 'adduservariable' instead of 'saveuservariable'", "Verbose")
+                        parameter = "adduservariable"
+                
+                # actually calling Domoticz API
+                DomoticzAPI("type=command&param={}&vname={}&vtype=2&vvalue={}".format(
+                    parameter, varname, str(self.InternalsDefaults)))
+                
                 self.Internals = self.InternalsDefaults.copy()  # we re-initialize the internal variables
             else:
                 try:
@@ -575,12 +608,17 @@ class BasePlugin:
         DomoticzAPI("type=command&param=updateuservariable&vname={}&vtype=2&vvalue={}".format(
             varname, str(self.Internals)))
 
+
     def WriteLog(self, message, level="Normal"):
 
-        if self.loglevel == "Verbose" and level == "Verbose":
-            Domoticz.Log(message)
+        if (self.loglevel == "Verbose" and level == "Verbose") or level == "Status":
+            if self.statussupported:
+                Domoticz.Status(message)
+            else:
+                Domoticz.Log(message)
         elif level == "Normal":
             Domoticz.Log(message)
+
 
     def SensorTimedOut(self, idx, name, datestring):
 
@@ -602,7 +640,7 @@ class BasePlugin:
                 self.ActiveSensors[idx] = False
         else:
             if not self.ActiveSensors[idx]:
-                Domoticz.Status("previously timed out temperature sensor '{}' is back online".format(name))
+                self.WriteLog("previously timed out temperature sensor '{}' is back online".format(name), "Status")
                 self.ActiveSensors[idx] = True
 
         return timedout
